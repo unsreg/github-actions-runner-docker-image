@@ -1,0 +1,17 @@
+name: "Setup gh (GitHub CLI)"
+description: "Install GitHub CLI on the runner (local composite action)."
+runs:
+  using: "composite"
+  steps:
+    - name: Install dependencies and gh
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Installing gh (GitHub CLI) via apt"
+        sudo apt-get update -y
+        sudo apt-get install -y gh
+        gh --version
+
+branding:
+  color: "blue"
+  icon: "terminal"

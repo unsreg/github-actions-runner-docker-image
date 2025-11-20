@@ -1,0 +1,159 @@
+# https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images#publishing-images-to-github-packages
+
+name: Create and publish a Docker image
+
+on:
+  push:
+    branches: ['main']
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    # Sets the permissions granted to the `GITHUB_TOKEN` for the actions in this job.
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest runner version from GitHub releases
+        id: get-runner-version
+        run: |
+          set -euo pipefail
+          API_URL="https://api.github.com/repos/actions/runner/releases/latest"
+          echo "Querying latest runner release from ${API_URL}"
+          DATA=$(curl --fail --silent --show-error --location "${API_URL}")
+          TAG_NAME=$(echo "${DATA}" | jq -r .tag_name)
+          # Strip leading 'v' if present
+          RUNNER_VERSION=$(echo "${TAG_NAME}" | sed -E 's/^v//')
+          echo "Found latest runner tag: ${TAG_NAME}, version: ${RUNNER_VERSION}"
+          # export to job env for convenience
+          echo "RUNNER_VERSION=${RUNNER_VERSION}" >> $GITHUB_ENV
+          echo "RUNNER_ASSET_NAME=actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" >> $GITHUB_ENV
+          # also set as step outputs so other steps can reference reliably
+          echo "RUNNER_VERSION=${RUNNER_VERSION}" >> $GITHUB_OUTPUT
+          echo "RUNNER_ASSET_NAME=actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Docker image (with cache and tags)
+        id: build-and-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-runner-version.outputs.RUNNER_VERSION }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUNNER_VERSION=${{ steps.get-runner-version.outputs.RUNNER_VERSION }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache,mode=max
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Install Cosign (for image signing)
+        run: |
+          COSIGN_VERSION=1.13.0
+          curl -sSL -o cosign https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64
+          chmod +x cosign
+          sudo mv cosign /usr/local/bin/cosign
+
+      - name: Sign image with Cosign (keyless)
+        run: |
+          # Verify cosign supports --keyless before attempting to sign
+          if cosign help 2>&1 | grep -q "--keyless"; then
+            echo "cosign supports --keyless; signing image"
+            cosign sign --keyless ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-runner-version.outputs.RUNNER_VERSION }}
+          else
+            echo "cosign does not support --keyless on this runner; skipping keyless signing" >&2
+            cosign version || true
+          fi
+
+      - name: Install Syft (for SBOM)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM (Syft)
+        run: |
+          syft ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RUNNER_VERSION }} -o json > sbom.json
+
+      - name: Set SHORT_SHA
+        id: set-short-sha
+        run: |
+          set -euo pipefail
+          echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Pick release token (prefer `RELEASE_PKG_TOKEN` secret)
+        id: pick-release-token
+        run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.RELEASE_PKG_TOKEN }}" ]; then
+            echo "Using RELEASE_PKG_TOKEN from secrets for release operations"
+            echo "release_token=${{ secrets.RELEASE_PKG_TOKEN }}" >> $GITHUB_OUTPUT
+          else
+            echo "RELEASE_PKG_TOKEN not set; falling back to GITHUB_TOKEN"
+            echo "release_token=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up GitHub CLI (local)
+        uses: ./.github/actions/setup-gh
+
+      - name: Create GitHub release and upload SBOM (using gh CLI)
+        id: gh_release
+        env:
+          GITHUB_TOKEN: ${{ steps.pick-release-token.outputs.release_token }}
+          TAG: runner-${{ steps.get-runner-version.outputs.RUNNER_VERSION }}-${{ steps.set-short-sha.outputs.short_sha }}
+          NAME: Runner ${{ steps.get-runner-version.outputs.RUNNER_VERSION }} - ${{ steps.set-short-sha.outputs.short_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "Creating release $TAG"
+
+          # Create release; if it exists, upload (clobber) the SBOM
+          if gh release create "$TAG" -t "$NAME" -n "SBOM for $TAG" sbom.json --repo "$REPO"; then
+            echo "Release created and SBOM attached"
+          else
+            echo "Release may already exist — attempting to upload asset"
+            gh release upload "$TAG" sbom.json --clobber --repo "$REPO"
+          fi
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build-and-push.outputs.digest }}
+          push-to-registry: true
+     
